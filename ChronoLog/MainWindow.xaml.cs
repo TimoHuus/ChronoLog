@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Windows;
@@ -23,6 +24,8 @@ namespace ChronoLog
         public MainWindow()
         {
             InitializeComponent();
+
+            // Ensure database schema exists (does not wipe existing DB)
             DatabaseHelper.InitializeDatabase();
 
             // Load History
@@ -32,20 +35,25 @@ namespace ChronoLog
 
             // Load Contexts
             _contextItems = new ObservableCollection<ContextItem>();
+            // Ensure reserved contexts are always on top
             _contextItems.Add(new ContextItem { Name = "All" });
             _contextItems.Add(new ContextItem { Name = "Archive" });
 
             foreach (var ctx in DatabaseHelper.GetContexts())
             {
-                _contextItems.Add(new ContextItem { Name = ctx });
+                // ctx is a DatabaseHelper.ContextRecord
+                // Skip reserved names to avoid duplicates
+                if (ctx.Name == "All" || ctx.Name == "Archive") continue;
+                _contextItems.Add(new ContextItem { Name = ctx.Name, Color = ctx.Color });
             }
-
             ContextList.ItemsSource = _contextItems;
             ContextList.SelectedIndex = 0; // Select "All" by default
 
             // Apply Filtering View
             _feedView = CollectionViewSource.GetDefaultView(_logEntries);
             _feedView.Filter = FilterFeed;
+
+            RefreshTodoCounts();
         }
 
         // --- WINDOW MECHANICS ---
@@ -92,6 +100,9 @@ namespace ChronoLog
 
         private void InputBox_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
+            // Hide placeholder when user begins typing
+            InputPlaceholder.Visibility = string.IsNullOrEmpty(InputBox.Text) ? Visibility.Visible : Visibility.Hidden;
+
             if (e.Key == System.Windows.Input.Key.Enter)
             {
                 e.Handled = true;
@@ -106,11 +117,28 @@ namespace ChronoLog
                         Note = newNote
                     };
 
+                    // Apply the selected context color immediately so the new entry shows colored time block
+                    var ctxItem = _contextItems != null ? System.Linq.Enumerable.FirstOrDefault(_contextItems, c => c.Name == _activeContext) : null;
+                    if (ctxItem != null)
+                    {
+                        newLog.Color = ctxItem.Color;
+                    }
+
                     DatabaseHelper.SaveEntry(newLog);
                     _logEntries.Add(newLog);
 
+                    if (newLog.IsTodo)
+                    {
+                        var ctxToUpdate = _contextItems.FirstOrDefault(c => c.Name == _activeContext);
+                        if (ctxToUpdate != null)
+                        {
+                            ctxToUpdate.TodoCount++;
+                        }
+                    }
+
                     FeedList.ScrollIntoView(newLog);
                     InputBox.Clear();
+                    InputPlaceholder.Visibility = Visibility.Visible;
                 }
             }
         }
@@ -135,10 +163,10 @@ namespace ChronoLog
         {
             string newCtx = NewContextBox.Text.Trim();
 
-            if (!string.IsNullOrWhiteSpace(newCtx) && newCtx != "All" && newCtx != "Archive" && newCtx != "General")
+            if (!string.IsNullOrWhiteSpace(newCtx) && newCtx != "All" && newCtx != "Archive")
             {
-                DatabaseHelper.AddContext(newCtx);
-                _contextItems.Add(new ContextItem { Name = newCtx });
+                string assignedColor = DatabaseHelper.AddContext(newCtx);
+                _contextItems.Add(new ContextItem { Name = newCtx, Color = assignedColor });
                 NewContextBox.Clear();
             }
         }
@@ -163,7 +191,9 @@ namespace ChronoLog
                     {
                         if (log.ContextName == ctxName)
                         {
-                            log.ContextName = "General";
+                            log.ContextName = "Archive";
+                            // Archive has no color
+                            log.Color = null;
                         }
                     }
 
@@ -199,10 +229,10 @@ namespace ChronoLog
             LogEntry entry = item as LogEntry;
 
             if (_activeContext == "All")
-                return entry?.ContextName != "General"; // Show everything EXCEPT the bin
+                return entry?.ContextName != "Archive"; // Show everything EXCEPT the bin
 
             if (_activeContext == "Archive")
-                return entry?.ContextName == "General"; // ONLY show the bin
+                return entry?.ContextName == "Archive"; // ONLY show the bin
 
             return entry?.ContextName == _activeContext;
         }
@@ -216,15 +246,12 @@ namespace ChronoLog
                 if (_activeContext == "All" || _activeContext == "Archive")
                 {
                     InputBox.IsEnabled = false;
-                    InputBox.Text = "Select a specific context";
+                    InputPlaceholder.Visibility = Visibility.Visible;
                 }
                 else
                 {
                     InputBox.IsEnabled = true;
-                    if (InputBox.Text == "Select a specific context")
-                    {
-                        InputBox.Clear();
-                    }
+                    InputPlaceholder.Visibility = Visibility.Hidden;
                 }
 
                 if (_feedView != null)
@@ -243,11 +270,63 @@ namespace ChronoLog
             // ShowDialog pauses the main window until the settings window is closed
             settings.ShowDialog();
         }
+
+        private void TodoCheckbox_Checked(object sender, RoutedEventArgs e)
+        {
+            if (sender is CheckBox cb && cb.DataContext is LogEntry entry)
+            {
+                if (entry.TryAcknowledge())
+                {
+                    DatabaseHelper.UpdateEntryDone(entry.Id, true);
+                    cb.IsEnabled = false;
+
+                    // Decrement the active counter
+                    var ctxToUpdate = _contextItems.FirstOrDefault(c => c.Name == entry.ContextName);
+                    if (ctxToUpdate != null && ctxToUpdate.TodoCount > 0)
+                    {
+                        ctxToUpdate.TodoCount--;
+                    }
+                }
+            }
+        }
+
+        private void RefreshTodoCounts()
+        {
+            foreach (var ctx in _contextItems)
+            {
+                if (ctx.Name == "All" || ctx.Name == "Archive") continue;
+
+                ctx.TodoCount = _logEntries.Count(log => log.ContextName == ctx.Name && log.IsTodo == true && log.Done != true);
+            }
+        }
     }
 
-    public class ContextItem
+    public class ContextItem : INotifyPropertyChanged
     {
+        private int _todoCount;
+
         public string Name { get; set; }
+        public string? Color { get; set; }
         public Visibility DeleteVisibility => Name == "All" || Name == "Archive" ? Visibility.Hidden : Visibility.Visible;
+
+        public int TodoCount
+        {
+            get => _todoCount;
+            set
+            {
+                if (_todoCount != value)
+                {
+                    _todoCount = value;
+                    OnPropertyChanged(nameof(TodoCount));
+                    OnPropertyChanged(nameof(BadgeVisibility));
+                }
+            }
+        }
+
+        public Visibility BadgeVisibility => TodoCount > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+        protected void OnPropertyChanged(string propertyName) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 }
